@@ -1,0 +1,67 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.metrics = void 0;
+class RequestMetrics {
+    constructor() {
+        this.metrics = {
+            totalRequests: 0,
+            successfulRequests: 0,
+            failedRequests: 0,
+            requestsByEndpoint: {},
+            responseTimes: []
+        };
+    }
+    recordRequest(endpoint, success, responseTime) {
+        this.metrics.totalRequests++;
+        if (success) {
+            this.metrics.successfulRequests++;
+        }
+        else {
+            this.metrics.failedRequests++;
+        }
+        this.metrics.requestsByEndpoint[endpoint] =
+            (this.metrics.requestsByEndpoint[endpoint] || 0) + 1;
+        this.metrics.responseTimes.push(responseTime);
+    }
+    getMetrics() {
+        const avgResponseTime = this.metrics.responseTimes.length > 0
+            ? this.metrics.responseTimes.reduce((a, b) => a + b, 0) / this.metrics.responseTimes.length
+            : 0;
+        return {
+            totalRequests: this.metrics.totalRequests,
+            successfulRequests: this.metrics.successfulRequests,
+            failedRequests: this.metrics.failedRequests,
+            averageResponseTime: Math.round(avgResponseTime * 100) / 100,
+            requestsByEndpoint: { ...this.metrics.requestsByEndpoint }
+        };
+    }
+    getPrometheusMetrics() {
+        const m = this.getMetrics();
+        return `# HELP cc2openai_total_requests Total requests
+# TYPE cc2openai_total_requests counter
+cc2openai_total_requests ${m.totalRequests}
+
+# HELP cc2openai_successful_requests Successful requests
+# TYPE cc2openai_successful_requests counter
+cc2openai_successful_requests ${m.successfulRequests}
+
+# HELP cc2openai_failed_requests Failed requests
+# TYPE cc2openai_failed_requests counter
+cc2openai_failed_requests ${m.failedRequests}
+
+# HELP cc2openai_average_response_time Average response time (ms)
+# TYPE cc2openai_average_response_time gauge
+cc2openai_average_response_time ${m.averageResponseTime}
+`;
+    }
+    reset() {
+        this.metrics = {
+            totalRequests: 0,
+            successfulRequests: 0,
+            failedRequests: 0,
+            requestsByEndpoint: {},
+            responseTimes: []
+        };
+    }
+}
+exports.metrics = new RequestMetrics();

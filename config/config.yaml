@@ -1,0 +1,24 @@
+server:
+  port: 3000
+  host: "0.0.0.0"
+
+backend:
+  url: "http://localhost:8080"
+  apiKey: "your-backend-api-key"
+  openApiSpecPath: "./config/openapi.json"
+
+auth:
+  apiKey: "your-proxy-api-key"
+
+retry:
+  maxRetries: 3
+  baseDelay: 1000
+  maxDelay: 10000
+  backoffMultiplier: 2
+  retryableStatusCodes: [502, 503, 504]
+
+monitoring:
+  enabled: true
+  logLevel: "info"
+  metricsEnabled: false
+  backendHealthCheck: true
