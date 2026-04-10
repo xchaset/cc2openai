@@ -6,10 +6,38 @@ import { setServerStartTime, checkBackendHealth, getHealthStatus } from './healt
 import { streamingHandler } from './streaming';
 import { withRetry } from './retry';
 
+// 脱敏处理：隐藏 API Key 的中间部分
+function maskApiKey(key: string): string {
+  if (!key || key.length < 10) return '***';
+  return key.slice(0, 6) + '...' + key.slice(-4);
+}
+
+// Anthropic content block types
+interface AnthropicTextBlock {
+  type: 'text';
+  text: string;
+}
+
+interface AnthropicToolUseBlock {
+  type: 'tool_use';
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+interface AnthropicToolResultBlock {
+  type: 'tool_result';
+  tool_use_id: string;
+  content?: string | Array<{ type: string; text?: string }>;
+  is_error?: boolean;
+}
+
+type AnthropicContentBlock = AnthropicTextBlock | AnthropicToolUseBlock | AnthropicToolResultBlock;
+
 // Anthropic API 请求格式
 interface AnthropicMessage {
   role: 'user' | 'assistant' | 'system';
-  content: string;
+  content: string | AnthropicContentBlock[];
 }
 
 interface AnthropicRequest {
@@ -27,7 +55,7 @@ interface AnthropicRequest {
 }
 
 // Anthropic API 响应格式
-interface AnthropicContentBlock {
+interface AnthropicResponseContentBlock {
   type: 'text' | 'tool_use' | 'tool_result';
   text?: string;
   id?: string;
@@ -42,7 +70,7 @@ interface AnthropicResponse {
   id: string;
   type: string;
   role: string;
-  content: AnthropicContentBlock[];
+  content: AnthropicResponseContentBlock[];
   model: string;
   stop_reason: string;
   stop_sequence?: string;
@@ -66,7 +94,11 @@ export class Server {
   }
 
   private setupMiddleware(): void {
-    this.app.use(express.json());
+    // 配置 body parser，增大请求体限制以支持大请求
+    this.app.use(express.json({
+      limit: '50mb',  // 增加请求体大小限制
+      strict: true     // 只接受数组和对象
+    }));
 
     // Request logging and metrics middleware
     this.app.use((req: Request, res: Response, next: NextFunction) => {
@@ -86,40 +118,27 @@ export class Server {
       next();
     });
 
-    // API Key authentication middleware
-    this.app.use((req: Request, res: Response, next: NextFunction) => {
-      // Skip auth for health check
-      if (req.path === '/health') {
-        next();
-        return;
-      }
-
-      const authHeader = req.headers.authorization;
-
-      if (!authHeader) {
-        res.status(401).json({ error: 'Authorization header required' });
-        return;
-      }
-
-      const apiKey = authHeader.replace('Bearer ', '');
-      const validKey = configManager.getAuthApiKey();
-
-      if (apiKey !== validKey) {
-        res.status(403).json({ error: 'Invalid API key' });
-        return;
-      }
-
-      next();
-    });
+    // No authentication - proxy is open (auth handled by backend)
   }
 
   /**
    * 将 Anthropic 请求转换为 OpenAI 格式
+   *
+   * Anthropic content 可以是 string 或 content block 数组:
+   *   - text block → 提取文本
+   *   - tool_use block → 转为 OpenAI tool_calls
+   *   - tool_result block → 转为 OpenAI tool message
    */
   private convertAnthropicToOpenAI(request: AnthropicRequest): Record<string, unknown> {
     interface OpenAIMessage {
       role: string;
-      content: string;
+      content: string | null;
+      tool_calls?: Array<{
+        id: string;
+        type: 'function';
+        function: { name: string; arguments: string };
+      }>;
+      tool_call_id?: string;
     }
 
     const messages: OpenAIMessage[] = [];
@@ -129,18 +148,96 @@ export class Server {
       const systemContent = Array.isArray(request.system)
         ? request.system.join('\n')
         : request.system;
-      messages.push({
-        role: 'system',
-        content: systemContent
-      });
+      messages.push({ role: 'system', content: systemContent });
     }
 
     // 转换消息
     for (const msg of request.messages) {
-      messages.push({
-        role: msg.role,
-        content: msg.content
-      });
+      // content 是纯 string，直接传
+      if (typeof msg.content === 'string') {
+        messages.push({ role: msg.role, content: msg.content });
+        continue;
+      }
+
+      // content 是 block 数组，需要拆分处理
+      const blocks = msg.content as AnthropicContentBlock[];
+      const textParts: string[] = [];
+      const toolCalls: OpenAIMessage['tool_calls'] = [];
+      const toolResults: OpenAIMessage[] = [];
+
+      for (const block of blocks) {
+        switch (block.type) {
+          case 'text':
+            textParts.push(block.text);
+            break;
+
+          case 'tool_use':
+            toolCalls.push({
+              id: block.id,
+              type: 'function',
+              function: {
+                name: block.name,
+                arguments: typeof block.input === 'string'
+                  ? block.input
+                  : JSON.stringify(block.input)
+              }
+            });
+            break;
+
+          case 'tool_result': {
+            let resultContent = '';
+            if (typeof block.content === 'string') {
+              resultContent = block.content;
+            } else if (Array.isArray(block.content)) {
+              resultContent = block.content
+                .map(c => c.text || '')
+                .filter(Boolean)
+                .join('\n');
+            }
+            toolResults.push({
+              role: 'tool',
+              content: resultContent,
+              tool_call_id: block.tool_use_id
+            });
+            break;
+          }
+        }
+      }
+
+      // assistant 消息：文本 + tool_calls
+      if (msg.role === 'assistant') {
+        const assistantMsg: OpenAIMessage = {
+          role: 'assistant',
+          content: textParts.length > 0 ? textParts.join('\n') : null
+        };
+        if (toolCalls.length > 0) {
+          assistantMsg.tool_calls = toolCalls;
+        }
+        messages.push(assistantMsg);
+      } else if (msg.role === 'user') {
+        // user 消息中可能包含 tool_result（Anthropic 把 tool result 放在 user 消息里）
+        if (toolResults.length > 0) {
+          // 先推 tool result messages
+          for (const tr of toolResults) {
+            messages.push(tr);
+          }
+          // 如果还有文本部分，单独推一条 user 消息
+          if (textParts.length > 0) {
+            messages.push({ role: 'user', content: textParts.join('\n') });
+          }
+        } else {
+          messages.push({
+            role: 'user',
+            content: textParts.join('\n') || ''
+          });
+        }
+      } else {
+        // 其他 role，拼接文本
+        messages.push({
+          role: msg.role,
+          content: textParts.join('\n') || ''
+        });
+      }
     }
 
     const openAIRequest: Record<string, unknown> = {
@@ -149,7 +246,6 @@ export class Server {
       stream: request.stream || false
     };
 
-    // 复制其他参数
     if (request.temperature !== undefined) {
       openAIRequest.temperature = request.temperature;
     }
@@ -230,6 +326,28 @@ export class Server {
       try {
         const request = req.body as AnthropicRequest;
 
+        // === 日志 1: 接收到的请求信息 ===
+        logger.info({
+          direction: 'INCOMING',
+          endpoint: '/v1/messages',
+          method: req.method,
+          url: req.originalUrl,
+          headers: {
+            'content-type': req.headers['content-type'],
+            'user-agent': req.headers['user-agent'],
+            authorization: req.headers.authorization ? maskApiKey(req.headers.authorization as string) : 'none'
+          },
+          body: {
+            model: request.model,
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            stream: request.stream,
+            system: request.system,
+            tools_count: request.tools?.length || 0,
+            messages_count: request.messages?.length || 0
+          }
+        }, '收到 Anthropic 请求');
+
         // 将 Anthropic 格式转换为 OpenAI 格式
         const openAIRequest = this.convertAnthropicToOpenAI(request);
 
@@ -239,6 +357,17 @@ export class Server {
         // 流式请求处理
         if (request.stream) {
           const retryConfig = configManager.getRetryConfig();
+
+          // === 日志 2: 发送给后端的流式请求 ===
+          logger.info({
+            direction: 'OUTGOING',
+            endpoint: `${backendUrl}/v1/chat/completions`,
+            headers: {
+              'content-type': 'application/json',
+              authorization: `Bearer ${maskApiKey(backendApiKey)}`
+            },
+            body: openAIRequest
+          }, '发送流式请求到后端');
 
           // Set SSE headers
           res.writeHead(200, {
@@ -271,6 +400,17 @@ export class Server {
         }
 
         // 非流式请求处理
+        // === 日志 2: 发送给后端的非流式请求 ===
+        logger.info({
+          direction: 'OUTGOING',
+          endpoint: `${backendUrl}/v1/chat/completions`,
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${maskApiKey(backendApiKey)}`
+          },
+          body: openAIRequest
+        }, '发送非流式请求到后端');
+
         const backendResponse = await fetch(`${backendUrl}/v1/chat/completions`, {
           method: 'POST',
           headers: {
@@ -282,6 +422,15 @@ export class Server {
 
         if (!backendResponse.ok) {
           const errorText = await backendResponse.text();
+
+          // === 日志 3: 后端错误响应 ===
+          logger.error({
+            direction: 'BACKEND_ERROR',
+            status: backendResponse.status,
+            statusText: backendResponse.statusText,
+            body: errorText
+          }, '后端返回错误');
+
           res.status(backendResponse.status).json({
             error: {
               type: 'api_error',
@@ -293,8 +442,20 @@ export class Server {
 
         const openAIResponse = await backendResponse.json();
 
+        // === 日志 3: 后端返回的响应 ===
+        logger.info({
+          direction: 'BACKEND_RESPONSE',
+          body: openAIResponse
+        }, '收到后端响应');
+
         // 将 OpenAI 格式响应转换为 Anthropic 格式
         const anthropicResponse = this.convertOpenAItoAnthropic(openAIResponse as Record<string, unknown>);
+
+        // === 日志 4: 转换后的 Anthropic 响应 ===
+        logger.info({
+          direction: 'OUTGOING_RESPONSE',
+          body: anthropicResponse
+        }, '发送转换后的 Anthropic 响应给客户端');
 
         res.json(anthropicResponse);
       } catch (error) {
@@ -313,8 +474,33 @@ export class Server {
       try {
         const request = req.body;
 
+        // === 日志 1: 接收到的请求信息 ===
+        logger.info({
+          direction: 'INCOMING',
+          endpoint: '/v1/chat/completions',
+          method: req.method,
+          url: req.originalUrl,
+          headers: {
+            'content-type': req.headers['content-type'],
+            'user-agent': req.headers['user-agent'],
+            authorization: req.headers.authorization ? maskApiKey(req.headers.authorization as string) : 'none'
+          },
+          body: request
+        }, '收到 OpenAI 请求');
+
         const backendUrl = configManager.getBackendUrl();
         const backendApiKey = configManager.getBackendApiKey();
+
+        // === 日志 2: 发送给后端的请求 ===
+        logger.info({
+          direction: 'OUTGOING',
+          endpoint: `${backendUrl}/v1/chat/completions`,
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${maskApiKey(backendApiKey)}`
+          },
+          body: request
+        }, '发送请求到后端');
 
         const backendResponse = await fetch(`${backendUrl}/v1/chat/completions`, {
           method: 'POST',
@@ -327,11 +513,27 @@ export class Server {
 
         if (!backendResponse.ok) {
           const errorText = await backendResponse.text();
+
+          // === 日志 3: 后端错误响应 ===
+          logger.error({
+            direction: 'BACKEND_ERROR',
+            status: backendResponse.status,
+            statusText: backendResponse.statusText,
+            body: errorText
+          }, '后端返回错误');
+
           res.status(backendResponse.status).json({ error: errorText });
           return;
         }
 
         const response = await backendResponse.json();
+
+        // === 日志 3: 后端返回的响应 ===
+        logger.info({
+          direction: 'BACKEND_RESPONSE',
+          body: response
+        }, '收到后端响应');
+
         res.json(response);
       } catch (error) {
         console.error('Error in chat/completions:', error);
