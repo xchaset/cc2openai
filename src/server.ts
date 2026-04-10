@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { configManager } from './config';
-import { logger } from './logger';
+import { logger, generateRequestId, truncate } from './logger';
 import { metrics } from './metrics';
 import { setServerStartTime, checkBackendHealth, getHealthStatus } from './health';
 import { streamingHandler } from './streaming';
@@ -323,51 +323,102 @@ export class Server {
 
     // Anthropic Messages API 端点 (接收 Anthropic 格式请求)
     this.app.post('/v1/messages', async (req: Request, res: Response) => {
+      const reqId = generateRequestId();
+      const startTime = Date.now();
+
       try {
         const request = req.body as AnthropicRequest;
 
-        // === 日志 1: 接收到的请求信息 ===
+        // ═══════════════════════════════════════════════════
+        // 📥 STEP 1: 客户端原始请求
+        // ═══════════════════════════════════════════════════
         logger.info({
-          direction: 'INCOMING',
+          reqId,
+          step: '1_INCOMING_REQUEST',
           endpoint: '/v1/messages',
           method: req.method,
           url: req.originalUrl,
+          clientIp: req.ip || req.socket.remoteAddress,
           headers: {
             'content-type': req.headers['content-type'],
             'user-agent': req.headers['user-agent'],
-            authorization: req.headers.authorization ? maskApiKey(req.headers.authorization as string) : 'none'
+            'x-api-key': req.headers['x-api-key'] ? maskApiKey(req.headers['x-api-key'] as string) : 'none',
+            'authorization': req.headers.authorization ? maskApiKey(req.headers.authorization as string) : 'none',
+            'anthropic-version': req.headers['anthropic-version'],
+            'accept': req.headers.accept
           },
           body: {
             model: request.model,
             max_tokens: request.max_tokens,
             temperature: request.temperature,
             stream: request.stream,
-            system: request.system,
+            system: truncate(request.system, 500),
             tools_count: request.tools?.length || 0,
-            messages_count: request.messages?.length || 0
+            tools_names: request.tools?.map(t => t.name) || [],
+            messages_count: request.messages?.length || 0,
+            messages: request.messages?.map((m, i) => ({
+              index: i,
+              role: m.role,
+              content_type: typeof m.content,
+              content_preview: truncate(
+                typeof m.content === 'string'
+                  ? m.content
+                  : JSON.stringify(m.content),
+                500
+              ),
+              content_blocks: Array.isArray(m.content)
+                ? (m.content as AnthropicContentBlock[]).map(b => ({ type: b.type }))
+                : undefined
+            }))
           }
-        }, '收到 Anthropic 请求');
+        }, `[${reqId}] 📥 收到 Anthropic 请求`);
 
-        // 将 Anthropic 格式转换为 OpenAI 格式
+        // ═══════════════════════════════════════════════════
+        // 🔄 STEP 2: 格式转换 Anthropic → OpenAI
+        // ═══════════════════════════════════════════════════
         const openAIRequest = this.convertAnthropicToOpenAI(request);
+
+        logger.info({
+          reqId,
+          step: '2_CONVERTED_REQUEST',
+          converted: {
+            model: openAIRequest.model,
+            stream: openAIRequest.stream,
+            temperature: openAIRequest.temperature,
+            max_tokens: openAIRequest.max_tokens,
+            messages_count: (openAIRequest.messages as unknown[])?.length || 0,
+            messages: (openAIRequest.messages as Array<Record<string, unknown>>)?.map((m, i) => ({
+              index: i,
+              role: m.role,
+              content_preview: truncate(m.content, 500),
+              has_tool_calls: !!(m.tool_calls),
+              tool_call_id: m.tool_call_id || undefined
+            })),
+            tools_count: (openAIRequest.tools as unknown[])?.length || 0
+          }
+        }, `[${reqId}] 🔄 Anthropic → OpenAI 转换完成`);
 
         const backendUrl = configManager.getBackendUrl();
         const backendApiKey = configManager.getBackendApiKey();
+        const targetUrl = `${backendUrl}/v1/chat/completions`;
 
         // 流式请求处理
         if (request.stream) {
           const retryConfig = configManager.getRetryConfig();
 
-          // === 日志 2: 发送给后端的流式请求 ===
+          // ═══════════════════════════════════════════════════
+          // 📤 STEP 3: 发送流式请求到后端
+          // ═══════════════════════════════════════════════════
           logger.info({
-            direction: 'OUTGOING',
-            endpoint: `${backendUrl}/v1/chat/completions`,
+            reqId,
+            step: '3_OUTGOING_STREAM_REQUEST',
+            targetUrl,
             headers: {
               'content-type': 'application/json',
-              authorization: `Bearer ${maskApiKey(backendApiKey)}`
+              'authorization': `Bearer ${maskApiKey(backendApiKey)}`
             },
-            body: openAIRequest
-          }, '发送流式请求到后端');
+            body: truncate(openAIRequest, 3000)
+          }, `[${reqId}] 📤 发送流式请求 → ${targetUrl}`);
 
           // Set SSE headers
           res.writeHead(200, {
@@ -376,13 +427,28 @@ export class Server {
             'Connection': 'keep-alive'
           });
 
+          let chunkCount = 0;
+          let totalContentLength = 0;
+
           try {
             await withRetry(
               () => streamingHandler.proxyStream(
-                `${backendUrl}/v1/chat/completions`,
+                targetUrl,
                 { ...openAIRequest, stream: true },
                 { format: 'sse', retryInterval: 1000 },
                 (chunk) => {
+                  chunkCount++;
+                  totalContentLength += chunk.length;
+                  // 只记录前 5 个 chunk 和每 50 个 chunk
+                  if (chunkCount <= 5 || chunkCount % 50 === 0) {
+                    logger.debug({
+                      reqId,
+                      step: '4_STREAM_CHUNK',
+                      chunkIndex: chunkCount,
+                      chunkSize: chunk.length,
+                      chunkPreview: truncate(chunk, 200)
+                    }, `[${reqId}] 📦 流式 chunk #${chunkCount}`);
+                  }
                   res.write(chunk);
                   return Promise.resolve();
                 },
@@ -390,8 +456,30 @@ export class Server {
               ),
               retryConfig
             );
+
+            // ═══════════════════════════════════════════════════
+            // ✅ STEP 5: 流式传输完成
+            // ═══════════════════════════════════════════════════
+            const duration = Date.now() - startTime;
+            logger.info({
+              reqId,
+              step: '5_STREAM_COMPLETE',
+              totalChunks: chunkCount,
+              totalContentLength,
+              durationMs: duration
+            }, `[${reqId}] ✅ 流式传输完成 (${chunkCount} chunks, ${duration}ms)`);
+
           } catch (streamError) {
-            console.error('Streaming error:', streamError);
+            const duration = Date.now() - startTime;
+            logger.error({
+              reqId,
+              step: '5_STREAM_ERROR',
+              error: streamError instanceof Error ? streamError.message : String(streamError),
+              stack: streamError instanceof Error ? streamError.stack : undefined,
+              chunksBeforeError: chunkCount,
+              durationMs: duration
+            }, `[${reqId}] ❌ 流式传输出错`);
+
             res.write(`data: ${JSON.stringify({ error: { type: 'stream_error', message: streamError instanceof Error ? streamError.message : 'Stream error' } })}\n\n`);
           }
 
@@ -399,19 +487,21 @@ export class Server {
           return;
         }
 
-        // 非流式请求处理
-        // === 日志 2: 发送给后端的非流式请求 ===
+        // ═══════════════════════════════════════════════════
+        // 📤 STEP 3: 发送非流式请求到后端
+        // ═══════════════════════════════════════════════════
         logger.info({
-          direction: 'OUTGOING',
-          endpoint: `${backendUrl}/v1/chat/completions`,
+          reqId,
+          step: '3_OUTGOING_REQUEST',
+          targetUrl,
           headers: {
             'content-type': 'application/json',
-            authorization: `Bearer ${maskApiKey(backendApiKey)}`
+            'authorization': `Bearer ${maskApiKey(backendApiKey)}`
           },
-          body: openAIRequest
-        }, '发送非流式请求到后端');
+          body: truncate(openAIRequest, 3000)
+        }, `[${reqId}] 📤 发送非流式请求 → ${targetUrl}`);
 
-        const backendResponse = await fetch(`${backendUrl}/v1/chat/completions`, {
+        const backendResponse = await fetch(targetUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -422,14 +512,20 @@ export class Server {
 
         if (!backendResponse.ok) {
           const errorText = await backendResponse.text();
+          const duration = Date.now() - startTime;
 
-          // === 日志 3: 后端错误响应 ===
+          // ═══════════════════════════════════════════════════
+          // ❌ STEP 4: 后端返回错误
+          // ═══════════════════════════════════════════════════
           logger.error({
-            direction: 'BACKEND_ERROR',
+            reqId,
+            step: '4_BACKEND_ERROR',
             status: backendResponse.status,
             statusText: backendResponse.statusText,
-            body: errorText
-          }, '后端返回错误');
+            responseHeaders: Object.fromEntries(backendResponse.headers.entries()),
+            body: truncate(errorText, 2000),
+            durationMs: duration
+          }, `[${reqId}] ❌ 后端返回 ${backendResponse.status} 错误`);
 
           res.status(backendResponse.status).json({
             error: {
@@ -442,24 +538,47 @@ export class Server {
 
         const openAIResponse = await backendResponse.json();
 
-        // === 日志 3: 后端返回的响应 ===
+        // ═══════════════════════════════════════════════════
+        // 📩 STEP 4: 后端原始响应 (OpenAI 格式)
+        // ═══════════════════════════════════════════════════
         logger.info({
-          direction: 'BACKEND_RESPONSE',
-          body: openAIResponse
-        }, '收到后端响应');
+          reqId,
+          step: '4_BACKEND_RESPONSE',
+          status: backendResponse.status,
+          responseHeaders: Object.fromEntries(backendResponse.headers.entries()),
+          body: truncate(openAIResponse, 3000)
+        }, `[${reqId}] 📩 收到后端响应 (OpenAI 格式)`);
 
         // 将 OpenAI 格式响应转换为 Anthropic 格式
         const anthropicResponse = this.convertOpenAItoAnthropic(openAIResponse as Record<string, unknown>);
 
-        // === 日志 4: 转换后的 Anthropic 响应 ===
+        const duration = Date.now() - startTime;
+
+        // ═══════════════════════════════════════════════════
+        // ✅ STEP 5: 转换后的 Anthropic 响应 → 客户端
+        // ═══════════════════════════════════════════════════
         logger.info({
-          direction: 'OUTGOING_RESPONSE',
-          body: anthropicResponse
-        }, '发送转换后的 Anthropic 响应给客户端');
+          reqId,
+          step: '5_OUTGOING_RESPONSE',
+          body: truncate(anthropicResponse, 3000),
+          usage: anthropicResponse.usage,
+          model: anthropicResponse.model,
+          stopReason: anthropicResponse.stop_reason,
+          contentBlocks: anthropicResponse.content?.map(b => ({ type: b.type, textLen: b.text?.length })),
+          durationMs: duration
+        }, `[${reqId}] ✅ 返回 Anthropic 响应给客户端 (${duration}ms)`);
 
         res.json(anthropicResponse);
       } catch (error) {
-        console.error('Error in /v1/messages:', error);
+        const duration = Date.now() - startTime;
+        logger.error({
+          reqId,
+          step: 'ERROR',
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+          durationMs: duration
+        }, `[${reqId}] 💥 /v1/messages 处理异常`);
+
         res.status(500).json({
           error: {
             type: 'server_error',
@@ -471,38 +590,64 @@ export class Server {
 
     // OpenAI Chat Completions 端点 (也支持，作为备选)
     this.app.post('/v1/chat/completions', async (req: Request, res: Response) => {
+      const reqId = generateRequestId();
+      const startTime = Date.now();
+
       try {
         const request = req.body;
 
-        // === 日志 1: 接收到的请求信息 ===
+        // ═══════════════════════════════════════════════════
+        // 📥 STEP 1: 客户端原始请求 (OpenAI 格式直通)
+        // ═══════════════════════════════════════════════════
         logger.info({
-          direction: 'INCOMING',
+          reqId,
+          step: '1_INCOMING_REQUEST',
           endpoint: '/v1/chat/completions',
           method: req.method,
           url: req.originalUrl,
+          clientIp: req.ip || req.socket.remoteAddress,
           headers: {
             'content-type': req.headers['content-type'],
             'user-agent': req.headers['user-agent'],
-            authorization: req.headers.authorization ? maskApiKey(req.headers.authorization as string) : 'none'
+            'authorization': req.headers.authorization ? maskApiKey(req.headers.authorization as string) : 'none',
+            'accept': req.headers.accept
           },
-          body: request
-        }, '收到 OpenAI 请求');
+          body: {
+            model: request.model,
+            stream: request.stream,
+            temperature: request.temperature,
+            max_tokens: request.max_tokens,
+            messages_count: request.messages?.length || 0,
+            messages: request.messages?.map((m: Record<string, unknown>, i: number) => ({
+              index: i,
+              role: m.role,
+              content_preview: truncate(m.content, 500),
+              has_tool_calls: !!(m.tool_calls),
+              tool_call_id: m.tool_call_id || undefined
+            })),
+            tools_count: request.tools?.length || 0
+          }
+        }, `[${reqId}] 📥 收到 OpenAI 直通请求`);
 
         const backendUrl = configManager.getBackendUrl();
         const backendApiKey = configManager.getBackendApiKey();
+        const targetUrl = `${backendUrl}/v1/chat/completions`;
 
-        // === 日志 2: 发送给后端的请求 ===
+        // ═══════════════════════════════════════════════════
+        // 📤 STEP 2: 转发请求到后端 (无需转换)
+        // ═══════════════════════════════════════════════════
         logger.info({
-          direction: 'OUTGOING',
-          endpoint: `${backendUrl}/v1/chat/completions`,
+          reqId,
+          step: '2_OUTGOING_REQUEST',
+          targetUrl,
           headers: {
             'content-type': 'application/json',
-            authorization: `Bearer ${maskApiKey(backendApiKey)}`
+            'authorization': `Bearer ${maskApiKey(backendApiKey)}`
           },
-          body: request
-        }, '发送请求到后端');
+          body: truncate(request, 3000)
+        }, `[${reqId}] 📤 转发请求 → ${targetUrl}`);
 
-        const backendResponse = await fetch(`${backendUrl}/v1/chat/completions`, {
+        const backendResponse = await fetch(targetUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -513,30 +658,47 @@ export class Server {
 
         if (!backendResponse.ok) {
           const errorText = await backendResponse.text();
+          const duration = Date.now() - startTime;
 
-          // === 日志 3: 后端错误响应 ===
           logger.error({
-            direction: 'BACKEND_ERROR',
+            reqId,
+            step: '3_BACKEND_ERROR',
             status: backendResponse.status,
             statusText: backendResponse.statusText,
-            body: errorText
-          }, '后端返回错误');
+            responseHeaders: Object.fromEntries(backendResponse.headers.entries()),
+            body: truncate(errorText, 2000),
+            durationMs: duration
+          }, `[${reqId}] ❌ 后端返回 ${backendResponse.status} 错误`);
 
           res.status(backendResponse.status).json({ error: errorText });
           return;
         }
 
         const response = await backendResponse.json();
+        const duration = Date.now() - startTime;
 
-        // === 日志 3: 后端返回的响应 ===
+        // ═══════════════════════════════════════════════════
+        // ✅ STEP 3: 后端响应 → 客户端
+        // ═══════════════════════════════════════════════════
         logger.info({
-          direction: 'BACKEND_RESPONSE',
-          body: response
-        }, '收到后端响应');
+          reqId,
+          step: '3_BACKEND_RESPONSE',
+          status: backendResponse.status,
+          body: truncate(response, 3000),
+          durationMs: duration
+        }, `[${reqId}] ✅ 返回后端响应给客户端 (${duration}ms)`);
 
         res.json(response);
       } catch (error) {
-        console.error('Error in chat/completions:', error);
+        const duration = Date.now() - startTime;
+        logger.error({
+          reqId,
+          step: 'ERROR',
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+          durationMs: duration
+        }, `[${reqId}] 💥 /v1/chat/completions 处理异常`);
+
         res.status(500).json({
           error: error instanceof Error ? error.message : 'Internal server error'
         });
